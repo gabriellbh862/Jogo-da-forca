@@ -37,6 +37,10 @@ Jogo-da-forca/
 ├── server.py
 ├── game.py
 ├── protocol.py
+├── discovery.py
+├── tests/
+├── docs/adr/
+├── CONTEXT.md
 ├── README.md
 └── .gitignore
 ```
@@ -46,11 +50,13 @@ Jogo-da-forca/
 Responsável por:
 
 - interface gráfica;
+- descoberta e seleção do servidor na rede (sem digitar IP);
+- hospedar uma partida embutida ("Anfitrião");
 - conexão com o servidor;
 - envio das jogadas;
 - exibição da palavra;
 - exibição das forcas;
-- reconexão do jogador.
+- reconexão do jogador (buscando o servidor salvo na rede).
 
 ### `server.py`
 
@@ -63,7 +69,8 @@ Responsável por:
 - controlar turnos;
 - detectar desconexões;
 - aplicar W.O.;
-- enviar o estado atualizado aos jogadores.
+- enviar o estado atualizado aos jogadores;
+- anunciar sua presença na rede local (via `discovery.py`).
 
 ### `game.py`
 
@@ -72,6 +79,10 @@ Contém as regras do jogo da forca.
 ### `protocol.py`
 
 Implementa o protocolo de comunicação TCP usando JSON.
+
+### `discovery.py`
+
+Descoberta automática de Servidores na rede local via broadcast UDP: `ServerAnnouncer` (lado do Servidor) e `ServerBrowser` (lado do Cliente). Veja [`CONTEXT.md`](CONTEXT.md) e [`docs/adr/0001-descoberta-via-socket-em-vez-de-api-http.md`](docs/adr/0001-descoberta-via-socket-em-vez-de-api-http.md).
 
 ---
 
@@ -122,13 +133,13 @@ cd Jogo-da-forca
 Antes de executar, é possível verificar a sintaxe:
 
 ```bash
-python -m py_compile protocol.py game.py server.py client.py
+python -m py_compile protocol.py game.py discovery.py server.py client.py
 ```
 
 No Linux/macOS, dependendo da instalação:
 
 ```bash
-python3 -m py_compile protocol.py game.py server.py client.py
+python3 -m py_compile protocol.py game.py discovery.py server.py client.py
 ```
 
 Se nenhum erro aparecer, os arquivos passaram na verificação de sintaxe.
@@ -171,15 +182,33 @@ No teste normal:
 python client.py
 ```
 
-A interface gráfica será aberta.
+A interface gráfica será aberta e, em instantes, o Servidor iniciado no passo anterior aparece sozinho na lista **"Servidores encontrados na rede"** — não é preciso digitar IP.
 
-Digite seu nome e clique em:
+Selecione o Servidor na lista, digite seu nome e clique em:
 
 ```text
 ENTRAR EM NOVA PARTIDA
 ```
 
 O primeiro jogador ficará aguardando o segundo jogador.
+
+---
+
+# 🖥️ Alternativa: hospedar pelo próprio cliente ("Anfitrião")
+
+Em vez de rodar `server.py` num terminal separado, qualquer cliente pode hospedar uma partida diretamente pela interface gráfica:
+
+```powershell
+python client.py
+```
+
+Na tela inicial, clique em:
+
+```text
+HOSPEDAR PARTIDA
+```
+
+Essa janela vira o Servidor daquela partida (mesma lógica de `server.py`) e fica visível para os outros clientes na lista de descoberta — mas **não joga**: quem hospeda só administra a partida. Para jogar, abra outro cliente na rede e clique em "Entrar" normalmente.
 
 ---
 
@@ -404,38 +433,17 @@ Antes de trabalhar com as VMs, teste:
 
 # 🌐 Jogar entre computadores na mesma rede
 
-Para executar o cliente em outro computador da mesma rede, primeiro descubra o IP do computador onde o servidor está rodando.
+Não é mais preciso descobrir ou digitar o IP do Servidor: basta que os computadores estejam na mesma rede local (mesmo Wi-Fi/LAN).
 
-No Windows:
+Um computador roda o Servidor (`python server.py --name VM1`, ou o botão "HOSPEDAR PARTIDA" pelo cliente). Nos demais computadores, ao abrir `python client.py`, esse Servidor aparece sozinho na lista **"Servidores encontrados na rede"** dentro de alguns segundos — é só selecioná-lo e entrar.
 
-```powershell
-ipconfig
-```
+Isso funciona por uma descoberta automática via broadcast UDP na rede local (veja [`docs/adr/0001-descoberta-via-socket-em-vez-de-api-http.md`](docs/adr/0001-descoberta-via-socket-em-vez-de-api-http.md)).
 
-Procure algo semelhante a:
+O firewall do computador que hospeda o Servidor precisa permitir:
 
 ```text
-Endereço IPv4: 192.168.1.50
-```
-
-No `client.py`, o servidor deverá apontar para esse IP em vez de:
-
-```python
-SERVER_HOST = "127.0.0.1"
-```
-
-Exemplo:
-
-```python
-SERVER_HOST = "192.168.1.50"
-```
-
-Depois execute o cliente normalmente no outro computador.
-
-O firewall do computador servidor precisa permitir conexões TCP na porta:
-
-```text
-5000
+TCP na porta 5000   (comunicação do jogo)
+UDP na porta 55201  (descoberta automática na rede)
 ```
 
 ---
@@ -550,7 +558,13 @@ python client.py
 Verificar sintaxe:
 
 ```powershell
-python -m py_compile protocol.py game.py server.py client.py
+python -m py_compile protocol.py game.py discovery.py server.py client.py
+```
+
+Rodar os testes automatizados (descoberta, hospedagem embutida e reconexão):
+
+```powershell
+python -m unittest discover -s tests
 ```
 
 ---
@@ -570,6 +584,9 @@ python -m py_compile protocol.py game.py server.py client.py
 - [x] Chute da palavra
 - [x] Reconexão de jogador
 - [x] W.O.
+- [x] Descoberta automática de servidores na rede (sem IP fixo)
+- [x] Hospedar partida embutido no cliente (Anfitrião)
+- [x] Reconexão buscando o servidor salvo pela rede
 
 ## Próximas etapas
 

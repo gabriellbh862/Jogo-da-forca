@@ -3,8 +3,11 @@ import os
 import queue
 import socket
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox
+
+from discovery import ServerBrowser
 
 from protocol import (
     send_message,
@@ -12,9 +15,19 @@ from protocol import (
     ConnectionClosed
 )
 
+from server import (
+    HangmanServer,
+    DEFAULT_HOST as HOSTED_SERVER_HOST,
+    DEFAULT_PORT as HOSTED_SERVER_PORT
+)
 
-SERVER_HOST = "127.0.0.1"
-SERVER_PORT = 5000
+
+DISCOVERY_REFRESH_MS = 500
+
+# Quanto tempo esperar a Descoberta automática
+# reencontrar o Servidor de uma Sessão salva.
+RECONNECT_SEARCH_TIMEOUT = 8.0
+RECONNECT_SEARCH_RETRY_MS = 300
 
 SESSION_PROFILE = os.getenv(
     "FORCA_PROFILE",
@@ -75,6 +88,19 @@ class HangmanClient:
             self.load_saved_session()
         )
 
+        self.discovered_servers = []
+
+        self._discovery_job = None
+
+        self._reconnect_search_job = None
+
+        self.browser = ServerBrowser()
+
+        self.browser.start()
+
+        # Anfitrião: Servidor embutido nesta janela (não joga).
+        self.hosted_server = None
+
         self.create_login_screen()
 
         self.root.after(
@@ -133,7 +159,8 @@ class HangmanClient:
         self,
         session_id,
         nickname,
-        room_id
+        room_id,
+        server_name
     ):
 
         data = {
@@ -144,7 +171,10 @@ class HangmanClient:
                 nickname,
 
             "room_id":
-                room_id
+                room_id,
+
+            "server_name":
+                server_name
         }
 
         try:
@@ -279,11 +309,351 @@ class HangmanClient:
 
         self.cancel_countdown()
 
+        self.cancel_discovery_refresh()
+
+        self.cancel_reconnect_search()
+
         for widget in (
             self.root.winfo_children()
         ):
 
             widget.destroy()
+
+    # ========================================================
+    # DESCOBERTA DE SERVIDORES NA REDE
+    # ========================================================
+
+    def cancel_discovery_refresh(self):
+
+        if self._discovery_job is not None:
+
+            try:
+
+                self.root.after_cancel(
+                    self._discovery_job
+                )
+
+            except Exception:
+                pass
+
+            self._discovery_job = None
+
+    def cancel_reconnect_search(self):
+
+        if self._reconnect_search_job is not None:
+
+            try:
+
+                self.root.after_cancel(
+                    self._reconnect_search_job
+                )
+
+            except Exception:
+                pass
+
+            self._reconnect_search_job = None
+
+    def refresh_discovered_servers(self):
+
+        if not hasattr(
+            self,
+            "server_listbox"
+        ):
+            return
+
+        servers = (
+            self.browser.list_servers()
+        )
+
+        old_names = [
+            server["name"]
+            for server in self.discovered_servers
+        ]
+
+        new_names = [
+            server["name"]
+            for server in servers
+        ]
+
+        # Evita destruir/recriar a lista (e o "piscar" visual)
+        # quando nada mudou desde o último refresh.
+        unchanged = (
+            [
+                (
+                    server["name"],
+                    server["host"],
+                    server["port"]
+                )
+                for server in servers
+            ]
+            == [
+                (
+                    server["name"],
+                    server["host"],
+                    server["port"]
+                )
+                for server in self.discovered_servers
+            ]
+        )
+
+        if not unchanged:
+
+            previous_selection = (
+                self.server_listbox
+                .curselection()
+            )
+
+            previously_selected_name = None
+
+            if (
+                previous_selection
+                and
+                previous_selection[0]
+                < len(old_names)
+            ):
+
+                previously_selected_name = (
+                    old_names[
+                        previous_selection[0]
+                    ]
+                )
+
+            self.server_listbox.delete(
+                0,
+                tk.END
+            )
+
+            for server in servers:
+
+                self.server_listbox.insert(
+                    tk.END,
+                    (
+                        f"{server['name']}  "
+                        f"({server['host']}:"
+                        f"{server['port']})"
+                    )
+                )
+
+            self.discovered_servers = servers
+
+            if not servers:
+
+                self.server_status_label.config(
+                    text="Procurando servidores na rede..."
+                )
+
+            else:
+
+                self.server_status_label.config(
+                    text=(
+                        f"{len(servers)} "
+                        "servidor(es) encontrado(s)."
+                    )
+                )
+
+                select_index = 0
+
+                if (
+                    previously_selected_name
+                    in new_names
+                ):
+
+                    select_index = (
+                        new_names.index(
+                            previously_selected_name
+                        )
+                    )
+
+                self.server_listbox.selection_clear(
+                    0,
+                    tk.END
+                )
+
+                self.server_listbox.selection_set(
+                    select_index
+                )
+
+        self._discovery_job = (
+            self.root.after(
+                DISCOVERY_REFRESH_MS,
+                self.refresh_discovered_servers
+            )
+        )
+
+    def get_selected_server(self):
+
+        if not hasattr(
+            self,
+            "server_listbox"
+        ):
+            return None
+
+        selection = (
+            self.server_listbox
+            .curselection()
+        )
+
+        if not selection:
+            return None
+
+        index = selection[0]
+
+        if index >= len(
+            self.discovered_servers
+        ):
+            return None
+
+        return self.discovered_servers[
+            index
+        ]
+
+    # ========================================================
+    # ANFITRIÃO (HOSPEDAR)
+    # ========================================================
+
+    def start_hosting(self):
+
+        if self.hosted_server is not None:
+            return
+
+        server_name = (
+            socket.gethostname()
+        )
+
+        self.hosted_server = (
+            HangmanServer(
+                host=HOSTED_SERVER_HOST,
+                port=HOSTED_SERVER_PORT,
+                server_name=server_name
+            )
+        )
+
+        thread = threading.Thread(
+            target=
+                self.run_hosted_server,
+
+            daemon=True
+        )
+
+        thread.start()
+
+        self.create_hosting_screen(
+            server_name
+        )
+
+    def run_hosted_server(self):
+
+        try:
+
+            self.hosted_server.start()
+
+        except OSError as error:
+
+            self.messages.put(
+                {
+                    "type":
+                        "HOSTING_FAILED",
+
+                    "message":
+                        str(error)
+                }
+            )
+
+    def stop_hosting(self):
+
+        if self.hosted_server is not None:
+
+            self.hosted_server.stop()
+
+            self.hosted_server = None
+
+        self.create_login_screen()
+
+    def create_hosting_screen(
+        self,
+        server_name
+    ):
+
+        self.clear()
+
+        container = tk.Frame(
+            self.root,
+            padx=50,
+            pady=40
+        )
+
+        container.pack(
+            expand=True
+        )
+
+        tk.Label(
+            container,
+            text="MODO ANFITRIÃO",
+            font=(
+                "Arial",
+                30,
+                "bold"
+            )
+        ).pack(
+            pady=15
+        )
+
+        tk.Label(
+            container,
+            text=(
+                f"Servidor \"{server_name}\" "
+                "ativo na rede."
+            ),
+            font=(
+                "Arial",
+                13,
+                "bold"
+            )
+        ).pack(
+            pady=5
+        )
+
+        tk.Label(
+            container,
+            text="Aguardando jogadores...",
+            font=(
+                "Arial",
+                12
+            )
+        ).pack(
+            pady=15
+        )
+
+        tk.Label(
+            container,
+            text=(
+                "Esta janela apenas hospeda a partida — "
+                "ela não joga.\n"
+                "Para jogar, abra outro cliente na rede "
+                "e clique em \"Entrar\"."
+            ),
+            font=(
+                "Arial",
+                10
+            ),
+            justify="center"
+        ).pack(
+            pady=10
+        )
+
+        tk.Button(
+            container,
+            text="PARAR SERVIDOR",
+            font=(
+                "Arial",
+                12,
+                "bold"
+            ),
+            command=
+                self.stop_hosting
+        ).pack(
+            pady=15
+        )
 
     # ========================================================
     # LOGIN
@@ -331,6 +701,44 @@ class HangmanClient:
             )
         ).pack(
             pady=5
+        )
+
+        # ====================================================
+        # HOSPEDAR
+        # ====================================================
+
+        tk.Button(
+            container,
+            text="HOSPEDAR PARTIDA",
+            font=(
+                "Arial",
+                11,
+                "bold"
+            ),
+            command=
+                self.start_hosting
+        ).pack(
+            pady=(
+                10,
+                0
+            )
+        )
+
+        tk.Label(
+            container,
+            text=(
+                "Sobe um servidor nesta máquina "
+                "(você não joga nesta janela)."
+            ),
+            font=(
+                "Arial",
+                9
+            )
+        ).pack(
+            pady=(
+                2,
+                10
+            )
         )
 
         # ====================================================
@@ -393,6 +801,61 @@ class HangmanClient:
             ).pack(
                 pady=5
             )
+
+        # ====================================================
+        # SERVIDORES NA REDE
+        # ====================================================
+
+        discovery_frame = tk.Frame(
+            container,
+            bd=1,
+            relief="solid",
+            padx=15,
+            pady=10
+        )
+
+        discovery_frame.pack(
+            pady=15,
+            fill="x"
+        )
+
+        tk.Label(
+            discovery_frame,
+            text="Servidores encontrados na rede",
+            font=(
+                "Arial",
+                12,
+                "bold"
+            )
+        ).pack()
+
+        self.server_listbox = tk.Listbox(
+            discovery_frame,
+            height=4,
+            font=(
+                "Arial",
+                11
+            ),
+            exportselection=False
+        )
+
+        self.server_listbox.pack(
+            fill="x",
+            pady=8
+        )
+
+        self.server_status_label = tk.Label(
+            discovery_frame,
+            text="Procurando servidores...",
+            font=(
+                "Arial",
+                10
+            )
+        )
+
+        self.server_status_label.pack()
+
+        self.refresh_discovered_servers()
 
         # ====================================================
         # NOVA PARTIDA
@@ -463,11 +926,7 @@ class HangmanClient:
         self.login_status = (
             tk.Label(
                 container,
-                text=(
-                    f"Servidor: "
-                    f"{SERVER_HOST}:"
-                    f"{SERVER_PORT}"
-                ),
+                text="",
                 font=(
                     "Arial",
                     10
@@ -514,6 +973,8 @@ class HangmanClient:
     def open_connection(
         self,
         handshake_payload,
+        host,
+        port,
         show_game_screen=True
     ):
 
@@ -539,8 +1000,8 @@ class HangmanClient:
 
         new_socket.connect(
             (
-                SERVER_HOST,
-                SERVER_PORT
+                host,
+                port
             )
         )
 
@@ -597,6 +1058,24 @@ class HangmanClient:
 
             return
 
+        server = (
+            self.get_selected_server()
+        )
+
+        if not server:
+
+            messagebox.showwarning(
+                "Atenção",
+                (
+                    "Nenhum servidor selecionado.\n\n"
+                    "Aguarde a descoberta encontrar "
+                    "um servidor na rede, ou hospede "
+                    "uma partida."
+                )
+            )
+
+            return
+
         # Nova partida significa abandonar
         # token antigo salvo localmente.
         self.clear_saved_session()
@@ -614,7 +1093,9 @@ class HangmanClient:
 
                     "nickname":
                         nickname
-                }
+                },
+                host=server["host"],
+                port=server["port"]
             )
 
         except OSError as error:
@@ -628,6 +1109,120 @@ class HangmanClient:
                     f"{error}"
                 )
             )
+
+    # ========================================================
+    # BUSCAR SERVIDOR SALVO NA REDE E RECONECTAR
+    # ========================================================
+
+    def find_server_and_connect(
+        self,
+        server_name,
+        handshake_payload,
+        show_game_screen,
+        on_status=None,
+        on_not_found=None,
+        deadline=None
+    ):
+
+        # Cancela qualquer busca anterior pendente (ex.: usuário
+        # clicou reconectar de novo antes da primeira terminar).
+        self.cancel_reconnect_search()
+
+        if deadline is None:
+
+            deadline = (
+                time.monotonic()
+                + RECONNECT_SEARCH_TIMEOUT
+            )
+
+        found = None
+
+        for server in self.browser.list_servers():
+
+            if server["name"] == server_name:
+
+                found = server
+                break
+
+        if found is not None:
+
+            try:
+
+                self.open_connection(
+                    handshake_payload,
+                    host=found["host"],
+                    port=found["port"],
+                    show_game_screen=show_game_screen
+                )
+
+            except OSError as error:
+
+                self.connected = False
+
+                if on_status:
+
+                    on_status(
+                        (
+                            "Falha ao reconectar: "
+                            f"{error}"
+                        ),
+                        "red"
+                    )
+
+                if on_not_found:
+                    on_not_found()
+
+            return
+
+        if time.monotonic() >= deadline:
+
+            if on_status:
+
+                on_status(
+                    (
+                        f"Servidor \"{server_name}\" "
+                        "não encontrado na rede."
+                    ),
+                    "red"
+                )
+
+            if on_not_found:
+                on_not_found()
+
+            return
+
+        if on_status:
+
+            remaining = max(
+                0,
+                int(
+                    deadline
+                    - time.monotonic()
+                )
+            )
+
+            on_status(
+                (
+                    f"Procurando servidor "
+                    f"\"{server_name}\" "
+                    f"na rede... ({remaining}s)"
+                ),
+                "darkorange"
+            )
+
+        self._reconnect_search_job = (
+            self.root.after(
+                RECONNECT_SEARCH_RETRY_MS,
+                lambda: self.find_server_and_connect(
+                    server_name,
+                    handshake_payload,
+                    show_game_screen,
+                    on_status,
+                    on_not_found,
+                    deadline
+                )
+            )
+        )
 
     # ========================================================
     # RECONECTAR PARTIDA SALVA
@@ -656,7 +1251,29 @@ class HangmanClient:
             )
         )
 
+        server_name = (
+            session.get(
+                "server_name"
+            )
+        )
+
         if not session_id:
+
+            self.clear_saved_session()
+            self.create_login_screen()
+            return
+
+        if not server_name:
+
+            messagebox.showwarning(
+                "Reconexão",
+                (
+                    "Esta sessão salva é de uma "
+                    "versão antiga e não tem um "
+                    "servidor associado.\n\n"
+                    "Entre em uma nova partida."
+                )
+            )
 
             self.clear_saved_session()
             self.create_login_screen()
@@ -666,7 +1283,10 @@ class HangmanClient:
             session_id
         )
 
-        try:
+        def on_status(
+            text,
+            color
+        ):
 
             if hasattr(
                 self,
@@ -674,30 +1294,31 @@ class HangmanClient:
             ):
 
                 self.login_status.config(
-                    text="Reconectando..."
+                    text=text,
+                    fg=color
                 )
 
-            self.open_connection(
-                {
-                    "type":
-                        "RECONNECT",
+        on_status(
+            (
+                f"Procurando servidor "
+                f"\"{server_name}\" "
+                "na rede..."
+            ),
+            "darkorange"
+        )
 
-                    "session_id":
-                        session_id
-                }
-            )
+        self.find_server_and_connect(
+            server_name,
+            {
+                "type":
+                    "RECONNECT",
 
-        except OSError as error:
-
-            self.connected = False
-
-            messagebox.showerror(
-                "Reconexão",
-                (
-                    "Não foi possível reconectar.\n\n"
-                    f"{error}"
-                )
-            )
+                "session_id":
+                    session_id
+            },
+            show_game_screen=True,
+            on_status=on_status
+        )
 
     # ========================================================
     # RECONECTAR SEM FECHAR A JANELA
@@ -711,19 +1332,23 @@ class HangmanClient:
             self.session_id
         )
 
-        if not session_id:
+        saved = (
+            self.load_saved_session()
+        )
 
-            saved = (
-                self.load_saved_session()
-            )
+        server_name = (
+            saved.get("server_name")
+            if saved
+            else None
+        )
 
-            if saved:
+        if not session_id and saved:
 
-                session_id = (
-                    saved.get(
-                        "session_id"
-                    )
+            session_id = (
+                saved.get(
+                    "session_id"
                 )
+            )
 
         if not session_id:
 
@@ -736,47 +1361,56 @@ class HangmanClient:
 
             return
 
+        if not server_name:
+
+            self.status_label.config(
+                text=(
+                    "Sessão salva é de uma versão antiga "
+                    "e não tem servidor associado. Volte "
+                    "ao menu e entre em uma nova partida."
+                ),
+                fg="red"
+            )
+
+            self.clear_saved_session()
+
+            return
+
         self.server_label.config(
             text="● RECONECTANDO...",
             fg="darkorange"
         )
 
-        self.status_label.config(
-            text=(
-                "Tentando recuperar sua sessão..."
-            ),
-            fg="darkorange"
-        )
+        def on_status(
+            text,
+            color
+        ):
 
-        try:
-
-            self.open_connection(
-                {
-                    "type":
-                        "RECONNECT",
-
-                    "session_id":
-                        session_id
-                },
-                show_game_screen=False
+            self.status_label.config(
+                text=text,
+                fg=color
             )
 
-        except OSError as error:
-
-            self.connected = False
+        def on_not_found():
 
             self.server_label.config(
                 text="● DESCONECTADO",
                 fg="red"
             )
 
-            self.status_label.config(
-                text=(
-                    "Falha ao reconectar: "
-                    f"{error}"
-                ),
-                fg="red"
-            )
+        self.find_server_and_connect(
+            server_name,
+            {
+                "type":
+                    "RECONNECT",
+
+                "session_id":
+                    session_id
+            },
+            show_game_screen=False,
+            on_status=on_status,
+            on_not_found=on_not_found
+        )
 
     # ========================================================
     # TELA DO JOGO
@@ -1300,7 +1934,8 @@ class HangmanClient:
             self.save_session(
                 self.session_id,
                 nickname,
-                room
+                room,
+                server
             )
 
             self.room_label.config(
@@ -1423,6 +2058,32 @@ class HangmanClient:
             self.reconnect_button.pack(
                 pady=3
             )
+
+        # ====================================================
+        # FALHA AO HOSPEDAR
+        # ====================================================
+
+        elif (
+            message_type
+            == "HOSTING_FAILED"
+        ):
+
+            self.hosted_server = None
+
+            messagebox.showerror(
+                "Hospedar",
+                (
+                    "Não foi possível hospedar "
+                    "uma partida.\n\n"
+                    +
+                    message.get(
+                        "message",
+                        ""
+                    )
+                )
+            )
+
+            self.create_login_screen()
 
     # ========================================================
     # ATUALIZAR JOGO
@@ -2148,6 +2809,18 @@ class HangmanClient:
         self.connection_generation += 1
 
         self.cancel_countdown()
+
+        self.cancel_discovery_refresh()
+
+        self.cancel_reconnect_search()
+
+        self.browser.stop()
+
+        if self.hosted_server is not None:
+
+            self.hosted_server.stop()
+
+            self.hosted_server = None
 
         self.close_socket_only()
 
