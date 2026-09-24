@@ -29,22 +29,81 @@ DISCOVERY_REFRESH_MS = 500
 RECONNECT_SEARCH_TIMEOUT = 8.0
 RECONNECT_SEARCH_RETRY_MS = 300
 
-SESSION_PROFILE = os.getenv(
-    "FORCA_PROFILE",
-    "default"
+BASE_DIR = os.path.dirname(
+    os.path.abspath(__file__)
+)
+
+# Quantos clientes locais o mecanismo de slot suporta
+# testar ao mesmo tempo neste computador.
+MAX_LOCAL_CLIENTS = 8
+
+
+def acquire_session_slot(base_dir):
+    """
+    Reserva um "slot" local (1, 2, 3...) para este processo do
+    cliente, na ordem em que os clientes vão sendo abertos neste
+    computador — Jogador 1 é sempre o primeiro `client.py` aberto,
+    Jogador 2 o segundo, e assim por diante. Cada slot usa seu
+    próprio arquivo de Sessão salva, para não haver conflito ao
+    testar vários jogadores na mesma máquina.
+
+    No Windows, o arquivo de trava usa O_TEMPORARY: o próprio
+    sistema operacional o apaga quando o processo termina (mesmo
+    em um fechamento abrupto), então nunca fica uma trava presa.
+    """
+
+    flags = (
+        os.O_CREAT
+        | os.O_EXCL
+        | os.O_WRONLY
+    )
+
+    if hasattr(os, "O_TEMPORARY"):
+        flags |= os.O_TEMPORARY
+
+    for slot in range(
+        1,
+        MAX_LOCAL_CLIENTS + 1
+    ):
+
+        lock_path = os.path.join(
+            base_dir,
+            f".forca_client_{slot}.lock"
+        )
+
+        try:
+            file_descriptor = os.open(
+                lock_path,
+                flags
+            )
+
+        except FileExistsError:
+            continue
+
+        return slot, file_descriptor
+
+    # Nenhum slot livre: identifica pelo PID (a Sessão
+    # simplesmente não persiste entre execuções nesse caso raro).
+    return os.getpid(), None
+
+
+SESSION_SLOT, SESSION_LOCK_FD = (
+    acquire_session_slot(BASE_DIR)
 )
 
 SESSION_FILE = os.path.join(
-    os.path.dirname(
-        os.path.abspath(__file__)
-    ),
-    f".forca_session_{SESSION_PROFILE}.json"
+    BASE_DIR,
+    f".forca_session_{SESSION_SLOT}.json"
 )
 
 
 class HangmanClient:
 
     def __init__(self):
+
+        self._session_lock_fd = (
+            SESSION_LOCK_FD
+        )
 
         self.root = tk.Tk()
 
@@ -2824,7 +2883,37 @@ class HangmanClient:
 
         self.close_socket_only()
 
+        self.release_session_slot()
+
         self.root.destroy()
+
+    def release_session_slot(self):
+
+        if self._session_lock_fd is None:
+            return
+
+        try:
+            os.close(self._session_lock_fd)
+
+        except OSError:
+            pass
+
+        self._session_lock_fd = None
+
+        # Sem O_TEMPORARY (fora do Windows), o SO não apaga a
+        # trava sozinho ao fechar o descritor.
+        if not hasattr(os, "O_TEMPORARY"):
+
+            lock_path = os.path.join(
+                BASE_DIR,
+                f".forca_client_{SESSION_SLOT}.lock"
+            )
+
+            try:
+                os.remove(lock_path)
+
+            except OSError:
+                pass
 
     def run(self):
 

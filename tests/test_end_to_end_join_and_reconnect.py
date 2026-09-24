@@ -4,8 +4,6 @@ import threading
 import time
 import unittest
 
-os.environ["FORCA_PROFILE"] = "e2e_test"
-
 from discovery import ServerAnnouncer, ServerBrowser
 from server import HangmanServer
 from client import HangmanClient, SESSION_FILE
