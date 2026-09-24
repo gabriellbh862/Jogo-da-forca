@@ -6,6 +6,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 
+from discovery import ServerAnnouncer
+
 from game import (
     HangmanGame,
     GameError
@@ -21,6 +23,10 @@ from protocol import (
 
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 5000
+
+# accept() reavalia self.running a cada N segundos, em vez de
+# ficar bloqueado indefinidamente.
+ACCEPT_POLL_INTERVAL = 1.0
 
 MAX_NICKNAME_LENGTH = 20
 
@@ -58,13 +64,21 @@ class HangmanServer:
         self,
         host=DEFAULT_HOST,
         port=DEFAULT_PORT,
-        server_name="VM1"
+        server_name="VM1",
+        announcer_factory=None
     ):
         self.host = host
         self.port = port
 
         self.server_name = (
             server_name
+        )
+
+        # Permite injetar um ServerAnnouncer customizado
+        # (ex.: em testes, para não depender de broadcast real).
+        self._announcer_factory = (
+            announcer_factory
+            or self._default_announcer
         )
 
         self.rooms = {}
@@ -83,6 +97,15 @@ class HangmanServer:
 
         self.running = (
             threading.Event()
+        )
+
+        self.announcer = None
+
+    def _default_announcer(self):
+
+        return ServerAnnouncer(
+            server_name=self.server_name,
+            game_port=self.port,
         )
 
     # ========================================================
@@ -1532,6 +1555,12 @@ class HangmanServer:
 
     def start(self):
 
+        # Marcado antes de qualquer setup: se stop() for chamado
+        # concorrentemente (ex.: Anfitrião fechou a janela na
+        # hora H), a checagem logo após bind/listen já enxerga isso
+        # em vez de um clear() virar no-op e o servidor "ressuscitar".
+        self.running.set()
+
         self.server_socket = (
             socket.socket(
                 socket.AF_INET,
@@ -1556,7 +1585,28 @@ class HangmanServer:
             50
         )
 
-        self.running.set()
+        # accept() com timeout: permite reavaliar self.running
+        # periodicamente em vez de depender só de outra thread
+        # conseguir destravar um accept() bloqueado (não garantido
+        # em todo SO) para encerrar o servidor.
+        self.server_socket.settimeout(
+            ACCEPT_POLL_INTERVAL
+        )
+
+        if not self.running.is_set():
+
+            # stop() rodou durante o setup acima.
+            try:
+                self.server_socket.close()
+
+            except OSError:
+                pass
+
+            return
+
+        self.announcer = self._announcer_factory()
+
+        self.announcer.start()
 
         self.log(
             "SERVER",
@@ -1577,13 +1627,29 @@ class HangmanServer:
                 self.running.is_set()
             ):
 
-                (
-                    client_socket,
-                    address
-                ) = (
-                    self.server_socket
-                    .accept()
-                )
+                try:
+
+                    (
+                        client_socket,
+                        address
+                    ) = (
+                        self.server_socket
+                        .accept()
+                    )
+
+                except socket.timeout:
+
+                    # Só um "acorda e confere self.running".
+                    continue
+
+                except OSError:
+
+                    # stop() fechou o socket de propósito
+                    # (ex.: Anfitrião fechou a janela).
+                    if not self.running.is_set():
+                        break
+
+                    raise
 
                 thread = (
                     threading.Thread(
@@ -1619,6 +1685,12 @@ class HangmanServer:
     def stop(self):
 
         self.running.clear()
+
+        if self.announcer:
+
+            self.announcer.stop()
+
+            self.announcer = None
 
         if self.server_socket:
 
