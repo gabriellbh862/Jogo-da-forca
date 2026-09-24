@@ -1,0 +1,3 @@
+.forca_session*.json
+__pycache__/
+*.pyc
