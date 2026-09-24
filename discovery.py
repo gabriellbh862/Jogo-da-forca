@@ -52,6 +52,17 @@ class ServerAnnouncer:
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
+        # Prende o socket à interface de rede real (ex.: Wi-Fi),
+        # em vez de deixar o SO escolher — numa máquina com VPN
+        # ativa (ex.: Radmin VPN), o broadcast pode sair pela
+        # interface virtual da VPN, que tem prioridade mais alta
+        # e não alcança ninguém na rede local de verdade.
+        try:
+            self._sock.bind((get_local_ip(), 0))
+
+        except OSError:
+            pass
+
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()

@@ -29,7 +29,11 @@ class ServerBrowserTests(unittest.TestCase):
             server_name=server_name,
             game_port=game_port,
             discovery_port=self.browser.port,
-            target_host="127.0.0.1",
+            # ServerAnnouncer agora se prende à interface real
+            # (get_local_ip()) para enviar; mandar para "127.0.0.1"
+            # a partir de um socket preso a essa interface não é
+            # entregue localmente no Windows.
+            target_host=get_local_ip(),
             interval=interval,
         )
         self.announcer.start()

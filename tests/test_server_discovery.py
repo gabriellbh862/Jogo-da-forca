@@ -22,7 +22,8 @@ class HangmanServerAnnouncesItselfTests(unittest.TestCase):
                 server_name="VM-TESTE",
                 game_port=0,
                 discovery_port=browser.port,
-                target_host="127.0.0.1",
+                # Ver comentário equivalente em test_discovery.py.
+                target_host=get_local_ip(),
                 interval=0.05,
             ),
         )
