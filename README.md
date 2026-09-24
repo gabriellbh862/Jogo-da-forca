@@ -214,23 +214,19 @@ Essa janela vira o Servidor daquela partida (mesma lógica de `server.py`) e fic
 
 # 👥 Testar dois jogadores no mesmo computador
 
-Como os clientes utilizam um arquivo local para guardar a sessão, é recomendado usar perfis diferentes durante os testes no mesmo PC.
+Não é preciso configurar nada: cada `client.py` aberto neste computador reserva automaticamente seu próprio arquivo de sessão, na ordem em que é aberto — o primeiro cliente é o Jogador 1, o segundo é o Jogador 2, e assim por diante.
 
 No PowerShell, abra um terminal para o Jogador 1:
 
 ```powershell
-$env:FORCA_PROFILE="jogador1"
 python client.py
 ```
 
 Abra outro terminal para o Jogador 2:
 
 ```powershell
-$env:FORCA_PROFILE="jogador2"
 python client.py
 ```
-
-> Caso a versão atual do `client.py` ainda não utilize `FORCA_PROFILE`, os dois clientes ainda conseguem jogar normalmente, porém o teste de reconexão pode compartilhar o mesmo arquivo de sessão. Para testes completos no mesmo computador, utilize arquivos de sessão separados por perfil.
 
 Os dois jogadores entrarão automaticamente na mesma sala:
 
@@ -365,12 +361,9 @@ para retornar.
 
 # 🔁 Testar reconexão
 
-Se estiver utilizando perfis diferentes no mesmo computador, abra novamente o jogador com o mesmo perfil.
-
-Exemplo:
+Feche a janela do jogador que caiu e abra `python client.py` de novo (sem fechar a janela do outro jogador, para que o slot local dele continue reservado):
 
 ```powershell
-$env:FORCA_PROFILE="jogador1"
 python client.py
 ```
 
@@ -543,15 +536,13 @@ Cliente:
 python client.py
 ```
 
-Dois clientes no mesmo PC para testes:
+Dois clientes no mesmo PC para testes (cada terminal vira um jogador, na ordem em que é aberto):
 
 ```powershell
-$env:FORCA_PROFILE="jogador1"
 python client.py
 ```
 
 ```powershell
-$env:FORCA_PROFILE="jogador2"
 python client.py
 ```
 

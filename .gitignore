@@ -1,3 +1,4 @@
 .forca_session*.json
+.forca_client_*.lock
 __pycache__/
 *.pyc
