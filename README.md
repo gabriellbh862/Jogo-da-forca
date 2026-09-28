@@ -4,11 +4,20 @@ Projeto de jogo da forca multiplayer utilizando **Python, sockets TCP, threads e
 
 O objetivo do projeto é permitir partidas entre dois jogadores, com o servidor controlando toda a lógica do jogo e, na versão final, utilizando **duas VMs com redundância e failover**.
 
+## Autores
+
+- Heitor Felipe Trindade Deodato
+- Gabriel Rodrigues do Vale
+- Vinícius Rodrigues Gonçalves Ferreira
+- Gabriel Borges Herenio
+
 ## Funcionalidades
 
 A versão atual possui:
 
 - Interface gráfica com Tkinter
+- Descoberta automática de Servidores na rede local (sem digitar IP)
+- Hospedar uma partida direto pelo cliente ("Anfitrião")
 - Dois jogadores por partida
 - Criação automática de salas
 - Turnos controlados pelo servidor
@@ -438,6 +447,8 @@ O firewall do computador que hospeda o Servidor precisa permitir:
 TCP na porta 5000   (comunicação do jogo)
 UDP na porta 55201  (descoberta automática na rede)
 ```
+
+Se o computador que hospeda o Servidor tiver uma VPN ativa (ex.: Radmin VPN, Hamachi), o anúncio de descoberta é preso à interface de rede real (Wi-Fi/Ethernet) em vez da interface virtual da VPN — assim outros computadores na mesma LAN continuam encontrando o Servidor mesmo com a VPN ligada.
 
 ---
 
