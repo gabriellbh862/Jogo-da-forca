@@ -4,7 +4,7 @@ import threading
 import time
 import unittest
 
-from discovery import ServerAnnouncer, ServerBrowser
+from discovery import ServerAnnouncer, ServerBrowser, get_local_ip
 from server import HangmanServer
 from client import HangmanClient, SESSION_FILE
 
@@ -46,7 +46,10 @@ class JoinAndReconnectEndToEndTests(unittest.TestCase):
                 server_name="VM-E2E",
                 game_port=GAME_PORT,
                 discovery_port=TEST_DISCOVERY_PORT,
-                target_host="127.0.0.1",
+                # ServerAnnouncer se prende à interface real para
+                # enviar; "127.0.0.1" não é entregue localmente a
+                # partir dela no Windows.
+                target_host=get_local_ip(),
                 interval=0.05,
             ),
         )
