@@ -19,6 +19,23 @@ class FakeBrowser:
         return list(self._servers)
 
 
+def primary(name="VM1", host="192.168.0.10", port=5000):
+    return {
+        "id": name,
+        "name": name,
+        "host": host,
+        "port": port,
+        "role": "PRIMARY",
+        "replication_port": port + 1000,
+    }
+
+
+def backup(name="VM2", host="192.168.0.11", port=5000):
+    server = primary(name=name, host=host, port=port)
+    server["role"] = "BACKUP"
+    return server
+
+
 def pump(root, timeout=3.0, interval=0.02):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -36,11 +53,9 @@ class FindServerAndConnectTests(unittest.TestCase):
         # escutando a rede de verdade) por um fake controlável.
         self.client.browser.stop()
 
-    def test_connects_when_server_is_already_known(self):
+    def test_connects_to_the_primary_when_already_known(self):
         self.client.browser = FakeBrowser(
-            servers=[
-                {"name": "VM1", "host": "192.168.0.10", "port": 5000}
-            ]
+            servers=[primary()]
         )
 
         calls = []
@@ -53,7 +68,6 @@ class FindServerAndConnectTests(unittest.TestCase):
         statuses = []
 
         self.client.find_server_and_connect(
-            "VM1",
             {"type": "RECONNECT", "session_id": "abc"},
             show_game_screen=False,
             on_status=lambda text, color: statuses.append((text, color)),
@@ -66,8 +80,9 @@ class FindServerAndConnectTests(unittest.TestCase):
         self.assertEqual(port, 5000)
         self.assertFalse(show_game_screen)
 
-    def test_reports_not_found_after_deadline_without_blocking(self):
-        self.client.browser = FakeBrowser(servers=[])
+    def test_ignores_backups_and_reports_not_found_after_deadline(self):
+        # Só há Reservas na rede: nenhum Principal para conectar.
+        self.client.browser = FakeBrowser(servers=[backup()])
 
         calls = []
         self.client.open_connection = lambda *a, **k: calls.append((a, k))
@@ -76,7 +91,6 @@ class FindServerAndConnectTests(unittest.TestCase):
         not_found_calls = []
 
         self.client.find_server_and_connect(
-            "VM-QUE-NAO-EXISTE",
             {"type": "RECONNECT", "session_id": "abc"},
             show_game_screen=False,
             on_status=lambda text, color: statuses.append((text, color)),
@@ -90,10 +104,12 @@ class FindServerAndConnectTests(unittest.TestCase):
         self.assertEqual(len(not_found_calls), 1)
         self.assertTrue(statuses)
         last_text, last_color = statuses[-1]
-        self.assertIn("não encontrado", last_text)
+        self.assertIn("Nenhum servidor ativo", last_text)
         self.assertEqual(last_color, "red")
 
-    def test_finds_server_that_appears_before_deadline(self):
+    def test_finds_new_primary_that_appears_before_deadline(self):
+        # Simula um failover: no início não há Principal (o antigo
+        # acabou de cair); pouco depois uma Reserva assume.
         browser = FakeBrowser(servers=[])
         self.client.browser = browser
 
@@ -103,15 +119,14 @@ class FindServerAndConnectTests(unittest.TestCase):
         )
 
         self.client.find_server_and_connect(
-            "VM2",
             {"type": "RECONNECT", "session_id": "xyz"},
             show_game_screen=False,
             deadline=time.monotonic() + 3.0,
         )
 
-        # Servidor "aparece" na rede um pouco depois.
+        # A Reserva "assume" como Principal um pouco depois.
         browser._servers = [
-            {"name": "VM2", "host": "10.0.0.5", "port": 5000}
+            primary(name="VM2", host="10.0.0.5", port=5000)
         ]
 
         pump(self.client.root, timeout=2.0)

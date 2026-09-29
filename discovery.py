@@ -2,6 +2,7 @@ import json
 import socket
 import threading
 import time
+import uuid
 
 
 DISCOVERY_PORT = 55201
@@ -10,6 +11,11 @@ ANNOUNCE_INTERVAL = 2.0
 SERVER_TIMEOUT = 6.0
 
 ANNOUNCE_TYPE = "FORCA_ANNOUNCE"
+
+# Papel de um Servidor na eleição de resiliência: só o Principal
+# aceita jogadores; os demais ficam de Reserva, prontos para assumir.
+ROLE_PRIMARY = "PRIMARY"
+ROLE_BACKUP = "BACKUP"
 
 
 def get_local_ip():
@@ -38,12 +44,31 @@ class ServerAnnouncer:
         discovery_port=DISCOVERY_PORT,
         target_host=BROADCAST_ADDRESS,
         interval=ANNOUNCE_INTERVAL,
+        server_id=None,
+        role_provider=None,
+        replication_port=None,
     ):
         self.server_name = server_name
         self.game_port = game_port
         self.discovery_port = discovery_port
         self.target_host = target_host
         self.interval = interval
+
+        self.server_id = (
+            server_id
+            or uuid.uuid4().hex
+        )
+
+        # Sem eleição (ex.: um Servidor sozinho, ou testes antigos),
+        # o Servidor sempre se anuncia como Principal.
+        self.role_provider = (
+            role_provider
+            or (lambda: ROLE_PRIMARY)
+        )
+
+        self.replication_port = (
+            replication_port
+        )
 
         self._stop_event = threading.Event()
         self._thread = None
@@ -76,9 +101,12 @@ class ServerAnnouncer:
             payload = json.dumps(
                 {
                     "type": ANNOUNCE_TYPE,
+                    "id": self.server_id,
                     "name": self.server_name,
                     "host": get_local_ip(),
                     "port": self.game_port,
+                    "role": self.role_provider(),
+                    "replication_port": self.replication_port,
                 }
             ).encode("utf-8")
 
@@ -127,6 +155,14 @@ class ServerBrowser:
         self.port = None
 
     def start(self):
+
+        # Idempotente: permite compartilhar a mesma instância entre
+        # quem já a iniciou (ex.: um Cliente) e quem só quer lê-la
+        # (ex.: um Servidor embutido nesse mesmo processo) sem
+        # tentar religar o socket.
+        if self._thread is not None:
+            return
+
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.settimeout(0.5)
@@ -178,9 +214,20 @@ class ServerBrowser:
 
         with self._lock:
             self._servers[key] = {
+                "id": message.get("id"),
                 "name": name,
                 "host": host,
                 "port": port,
+                # Anúncios antigos (sem eleição) não têm "role":
+                # trata como Principal, para não quebrar quem já
+                # dependia do comportamento de Servidor único.
+                "role": (
+                    message.get("role")
+                    or ROLE_PRIMARY
+                ),
+                "replication_port": (
+                    message.get("replication_port")
+                ),
                 "last_seen": time.monotonic(),
             }
 
@@ -206,11 +253,23 @@ class ServerBrowser:
                 key=lambda server: server["name"],
             )
 
+    def get_primary(self):
+        """O Servidor Principal atualmente visível na rede, ou None."""
+
+        for server in self.list_servers():
+
+            if server.get("role") == ROLE_PRIMARY:
+                return server
+
+        return None
+
     def stop(self):
         self._stop_event.set()
 
         if self._thread is not None:
             self._thread.join(timeout=1.0)
+
+        self._thread = None
 
         if self._sock is not None:
             try:

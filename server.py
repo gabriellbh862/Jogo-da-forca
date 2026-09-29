@@ -4,9 +4,15 @@ import secrets
 import socket
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 
-from discovery import ServerAnnouncer
+from discovery import (
+    ROLE_BACKUP,
+    ROLE_PRIMARY,
+    ServerAnnouncer,
+    ServerBrowser,
+)
 
 from game import (
     HangmanGame,
@@ -34,6 +40,35 @@ MIN_ACTION_INTERVAL = 0.10
 
 # Tempo permitido para o jogador voltar.
 RECONNECT_TIMEOUT = 40
+
+# ============================================================
+# RESILIÊNCIA: ELEIÇÃO DE PRINCIPAL E REPLICAÇÃO PARA RESERVAS
+# ============================================================
+
+# Papel transitório: ainda decidindo se há um Principal na rede
+# antes de aceitar jogadores (evita dois Servidores recém-abertos
+# ao mesmo tempo virarem Principal ao mesmo tempo).
+ROLE_ELECTING = "ELECTING"
+
+# Quanto tempo um Servidor recém-iniciado espera ouvindo a rede
+# antes de decidir seu papel — dá tempo de qualquer Principal já
+# ativo (ou concorrente subindo ao mesmo tempo) se anunciar. Mais
+# que o dobro do intervalo de anúncio (discovery.ANNOUNCE_INTERVAL)
+# de propósito: garante pelo menos dois anúncios de cada Servidor
+# concorrente dentro da janela, para um único pacote UDP perdido
+# não fazer dois Servidores se elegerem Principal ao mesmo tempo.
+STARTUP_GRACE_PERIOD = 5.0
+
+# De quanto em quanto tempo um Servidor reavalia se continua
+# Reserva, se já pode assumir como Principal (Principal nunca
+# reavalia: uma vez eleito, só perde o papel se cair de vez).
+ELECTION_INTERVAL = 1.0
+
+# De quanto em quanto tempo o Principal replica o estado das
+# salas/sessões para as Reservas conhecidas na rede.
+REPLICATION_INTERVAL = 1.0
+
+REPLICATION_SYNC_TYPE = "REPLICATION_SYNC"
 
 
 @dataclass
@@ -65,7 +100,12 @@ class HangmanServer:
         host=DEFAULT_HOST,
         port=DEFAULT_PORT,
         server_name="VM1",
-        announcer_factory=None
+        announcer_factory=None,
+        peer_browser_factory=None,
+        server_id=None,
+        election_interval=ELECTION_INTERVAL,
+        startup_grace_period=STARTUP_GRACE_PERIOD,
+        replication_interval=REPLICATION_INTERVAL,
     ):
         self.host = host
         self.port = port
@@ -74,11 +114,42 @@ class HangmanServer:
             server_name
         )
 
+        # Identidade única deste processo na eleição: o menor
+        # id entre os Servidores vivos vira o Principal.
+        self.server_id = (
+            server_id
+            or uuid.uuid4().hex
+        )
+
         # Permite injetar um ServerAnnouncer customizado
         # (ex.: em testes, para não depender de broadcast real).
         self._announcer_factory = (
             announcer_factory
             or self._default_announcer
+        )
+
+        # Permite injetar/compartilhar o ServerBrowser usado para
+        # enxergar outros Servidores na rede (ex.: o Anfitrião
+        # reaproveita o ServerBrowser que o próprio Cliente já usa,
+        # para não abrir um segundo socket na mesma porta UDP).
+        self._peer_browser_factory = (
+            peer_browser_factory
+        )
+
+        self._owns_peer_browser = (
+            peer_browser_factory is None
+        )
+
+        self._election_interval = (
+            election_interval
+        )
+
+        self._startup_grace_period = (
+            startup_grace_period
+        )
+
+        self._replication_interval = (
+            replication_interval
         )
 
         self.rooms = {}
@@ -99,13 +170,40 @@ class HangmanServer:
             threading.Event()
         )
 
+        # Sinaliza as threads de eleição/replicação para pararem
+        # (ao contrário de "running", começa "limpo" e é setado
+        # ao parar — mesmo padrão do ServerAnnouncer).
+        self._shutdown_event = (
+            threading.Event()
+        )
+
         self.announcer = None
+
+        self.peer_browser = None
+
+        # Começa "decidindo": só aceita jogadores depois da
+        # eleição inicial (ver STARTUP_GRACE_PERIOD).
+        self.role = ROLE_ELECTING
+
+        self.replication_port = None
+
+        self._replication_socket = None
 
     def _default_announcer(self):
 
         return ServerAnnouncer(
             server_name=self.server_name,
             game_port=self.port,
+            server_id=self.server_id,
+            role_provider=lambda: self.role,
+            replication_port=self.replication_port,
+        )
+
+    def _default_peer_browser(self):
+
+        return ServerBrowser(
+            discovery_port=
+                self.announcer.discovery_port
         )
 
     # ========================================================
@@ -1273,6 +1371,19 @@ class HangmanServer:
         sock,
         address
     ):
+        # Reserva (ou ainda decidindo o papel): não aceita
+        # jogadores — só o Principal administra partidas.
+        if self.role != ROLE_PRIMARY:
+
+            raise ValueError(
+                (
+                    "Este servidor está em modo de "
+                    "reserva no momento. Aguarde a "
+                    "descoberta encontrar o servidor "
+                    "principal."
+                )
+            )
+
         message = recv_message(
             sock
         )
@@ -1550,6 +1661,353 @@ class HangmanServer:
                 )
 
     # ========================================================
+    # RESILIÊNCIA: ELEIÇÃO
+    # ========================================================
+
+    def _run_election_once(self):
+
+        # Principal é "vitalício": só perde o papel silenciosamente
+        # (parando de se anunciar) se o processo cair de verdade.
+        # Reavaliar continuamente abriria brecha para um Servidor
+        # de id menor "roubar" a liderança no meio de uma partida.
+        if self.role == ROLE_PRIMARY:
+            return
+
+        peers = [
+            peer
+            for peer in self.peer_browser.list_servers()
+            if peer.get("id") != self.server_id
+        ]
+
+        primary_peer = next(
+            (
+                peer
+                for peer in peers
+                if peer.get("role") == ROLE_PRIMARY
+            ),
+            None
+        )
+
+        if primary_peer is not None:
+
+            if self.role != ROLE_BACKUP:
+
+                self.log(
+                    "ELECTION",
+                    (
+                        "Servidor principal detectado "
+                        f"({primary_peer['name']}). "
+                        "Operando como reserva."
+                    )
+                )
+
+            self.role = ROLE_BACKUP
+
+            return
+
+        # Ninguém se anuncia como Principal: só quem tem o menor id
+        # entre os conhecidos assume — evita dois Servidores subindo
+        # juntos virarem Principal ao mesmo tempo (cada um só decide
+        # depois de ouvir a rede por STARTUP_GRACE_PERIOD).
+        known_ids = (
+            [self.server_id]
+            +
+            [
+                peer["id"]
+                for peer in peers
+                if peer.get("id")
+            ]
+        )
+
+        if self.server_id == min(known_ids):
+            self._promote_to_primary()
+
+        else:
+
+            if self.role != ROLE_BACKUP:
+
+                self.log(
+                    "ELECTION",
+                    (
+                        "Outro servidor tem prioridade "
+                        "para principal. Operando como "
+                        "reserva."
+                    )
+                )
+
+            self.role = ROLE_BACKUP
+
+    def _promote_to_primary(self):
+
+        with self.state_lock:
+
+            was_backup = (
+                self.role == ROLE_BACKUP
+            )
+
+            self.role = ROLE_PRIMARY
+
+            now = time.time()
+
+            restored_sessions = 0
+
+            for session in self.sessions.values():
+
+                # Sessão replicada de um Principal anterior: os
+                # sockets daquele processo não existem mais aqui,
+                # então trata como se o jogador tivesse acabado de
+                # cair, com uma janela nova de RECONNECT_TIMEOUT
+                # para voltar a esse (novo) Principal.
+                if session.disconnect_timer is not None:
+                    continue
+
+                session.connected = False
+                session.sock = None
+
+                restored_sessions += 1
+
+                deadline = (
+                    now + RECONNECT_TIMEOUT
+                )
+
+                session.disconnect_deadline = (
+                    deadline
+                )
+
+                timer = threading.Timer(
+                    RECONNECT_TIMEOUT,
+                    self.handle_walkover,
+                    args=(
+                        session.session_id,
+                        deadline
+                    )
+                )
+
+                timer.daemon = True
+
+                session.disconnect_timer = timer
+
+                timer.start()
+
+        if was_backup:
+
+            self.log(
+                "ELECTION",
+                (
+                    "Assumiu como servidor principal "
+                    f"(failover). {len(self.rooms)} "
+                    f"sala(s) e {restored_sessions} "
+                    "sessão(ões) restauradas."
+                )
+            )
+
+        else:
+
+            self.log(
+                "ELECTION",
+                "Assumiu como servidor principal."
+            )
+
+    def _election_loop(self):
+
+        # Espera ouvir a rede antes da primeira decisão: dá tempo
+        # de qualquer Principal já ativo (ou concorrente subindo
+        # ao mesmo tempo) se anunciar.
+        if self._shutdown_event.wait(
+            self._startup_grace_period
+        ):
+            return
+
+        while True:
+
+            self._run_election_once()
+
+            if self._shutdown_event.wait(
+                self._election_interval
+            ):
+                break
+
+    # ========================================================
+    # RESILIÊNCIA: REPLICAÇÃO
+    # ========================================================
+
+    def build_snapshot(self):
+
+        with self.state_lock:
+
+            return {
+                "type": REPLICATION_SYNC_TYPE,
+
+                "room_counter": self.room_counter,
+
+                "rooms": [
+                    game.snapshot()
+                    for game in self.rooms.values()
+                ],
+
+                "sessions": [
+                    {
+                        "session_id": session.session_id,
+                        "nickname": session.nickname,
+                        "room_id": session.room_id,
+                    }
+                    for session in self.sessions.values()
+                ],
+            }
+
+    def apply_snapshot(self, payload):
+
+        with self.state_lock:
+
+            # Um Principal nunca aceita estado alheio (ex.: um
+            # pacote atrasado de um Principal antigo já derrubado).
+            if self.role == ROLE_PRIMARY:
+                return
+
+            rooms = {}
+            room_locks = {}
+
+            for room_data in payload.get("rooms", []):
+
+                game = HangmanGame.from_snapshot(
+                    room_data
+                )
+
+                rooms[game.room_id] = game
+
+                room_locks[game.room_id] = (
+                    threading.RLock()
+                )
+
+            sessions = {}
+
+            for session_data in payload.get(
+                "sessions", []
+            ):
+
+                session_id = session_data[
+                    "session_id"
+                ]
+
+                sessions[session_id] = ClientSession(
+                    session_id=session_id,
+                    nickname=session_data["nickname"],
+                    room_id=session_data["room_id"],
+                    sock=None,
+                    address=None,
+                    connected=False,
+                )
+
+            self.rooms = rooms
+            self.room_locks = room_locks
+            self.sessions = sessions
+
+            self.room_counter = max(
+                self.room_counter,
+                payload.get("room_counter", 0)
+            )
+
+    def _push_snapshot(self, host, port, snapshot):
+
+        sock = socket.socket(
+            socket.AF_INET,
+            socket.SOCK_STREAM
+        )
+
+        try:
+            sock.settimeout(1.0)
+            sock.connect((host, port))
+            send_message(sock, snapshot)
+
+        except (OSError, ProtocolError):
+            pass
+
+        finally:
+
+            try:
+                sock.close()
+
+            except OSError:
+                pass
+
+    def _replication_sender_loop(self):
+
+        while not self._shutdown_event.wait(
+            self._replication_interval
+        ):
+
+            if self.role != ROLE_PRIMARY:
+                continue
+
+            snapshot = self.build_snapshot()
+
+            for peer in self.peer_browser.list_servers():
+
+                if peer.get("id") == self.server_id:
+                    continue
+
+                replication_port = peer.get(
+                    "replication_port"
+                )
+
+                if not replication_port:
+                    continue
+
+                self._push_snapshot(
+                    peer["host"],
+                    replication_port,
+                    snapshot
+                )
+
+    def _replication_listener_loop(self):
+
+        while self.running.is_set():
+
+            try:
+
+                (
+                    connection,
+                    _address
+                ) = (
+                    self._replication_socket
+                    .accept()
+                )
+
+            except socket.timeout:
+                continue
+
+            except OSError:
+                break
+
+            try:
+
+                payload = recv_message(
+                    connection
+                )
+
+                if (
+                    payload.get("type")
+                    == REPLICATION_SYNC_TYPE
+                ):
+
+                    self.apply_snapshot(payload)
+
+            except (
+                ConnectionClosed,
+                ProtocolError,
+                OSError
+            ):
+                pass
+
+            finally:
+
+                try:
+                    connection.close()
+
+                except OSError:
+                    pass
+
+    # ========================================================
     # START
     # ========================================================
 
@@ -1560,6 +2018,8 @@ class HangmanServer:
         # hora H), a checagem logo após bind/listen já enxerga isso
         # em vez de um clear() virar no-op e o servidor "ressuscitar".
         self.running.set()
+
+        self._shutdown_event.clear()
 
         self.server_socket = (
             socket.socket(
@@ -1580,6 +2040,16 @@ class HangmanServer:
                 self.port
             )
         )
+
+        # Porta efêmera (port=0): descobre a porta real escolhida
+        # pelo SO, para anunciar/usar o valor de verdade daqui em
+        # diante (ex.: no cálculo da porta de replicação).
+        if self.port == 0:
+
+            self.port = (
+                self.server_socket
+                .getsockname()[1]
+            )
 
         self.server_socket.listen(
             50
@@ -1604,9 +2074,60 @@ class HangmanServer:
 
             return
 
+        self._replication_socket = (
+            socket.socket(
+                socket.AF_INET,
+                socket.SOCK_STREAM
+            )
+        )
+
+        self._replication_socket.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_REUSEADDR,
+            1
+        )
+
+        self._replication_socket.bind(
+            (self.host, 0)
+        )
+
+        self.replication_port = (
+            self._replication_socket
+            .getsockname()[1]
+        )
+
+        self._replication_socket.listen(10)
+
+        self._replication_socket.settimeout(
+            ACCEPT_POLL_INTERVAL
+        )
+
         self.announcer = self._announcer_factory()
 
         self.announcer.start()
+
+        self.peer_browser = (
+            self._peer_browser_factory()
+            if self._peer_browser_factory
+            else self._default_peer_browser()
+        )
+
+        self.peer_browser.start()
+
+        threading.Thread(
+            target=self._election_loop,
+            daemon=True
+        ).start()
+
+        threading.Thread(
+            target=self._replication_sender_loop,
+            daemon=True
+        ).start()
+
+        threading.Thread(
+            target=self._replication_listener_loop,
+            daemon=True
+        ).start()
 
         self.log(
             "SERVER",
@@ -1618,7 +2139,10 @@ class HangmanServer:
 
         self.log(
             "SERVER",
-            "Aguardando jogadores..."
+            (
+                "Verificando se já existe um "
+                "servidor principal na rede..."
+            )
         )
 
         try:
@@ -1686,11 +2210,25 @@ class HangmanServer:
 
         self.running.clear()
 
+        self._shutdown_event.set()
+
         if self.announcer:
 
             self.announcer.stop()
 
             self.announcer = None
+
+        # Só para o ServerBrowser se foi este Servidor quem o criou
+        # (senão pertence a quem injetou, ex.: o Cliente Anfitrião
+        # ainda precisa dele depois de "PARAR SERVIDOR").
+        if (
+            self.peer_browser
+            and self._owns_peer_browser
+        ):
+
+            self.peer_browser.stop()
+
+        self.peer_browser = None
 
         if self.server_socket:
 
@@ -1699,6 +2237,16 @@ class HangmanServer:
 
             except OSError:
                 pass
+
+        if self._replication_socket:
+
+            try:
+                self._replication_socket.close()
+
+            except OSError:
+                pass
+
+            self._replication_socket = None
 
         with self.state_lock:
 
@@ -1712,6 +2260,9 @@ class HangmanServer:
                 ):
 
                     session.disconnect_timer.cancel()
+
+                if session.sock is None:
+                    continue
 
                 try:
                     session.sock.close()

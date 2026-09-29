@@ -38,6 +38,18 @@ class JoinAndReconnectEndToEndTests(unittest.TestCase):
 
         self.addCleanup(self._remove_session_file)
 
+        # Um único ServerBrowser, compartilhado pelo Servidor (para
+        # ele enxergar outros Servidores na eleição) e por todos os
+        # Clientes deste teste: no Windows, dois sockets ligados à
+        # mesma porta UDP no mesmo processo "roubam" pacotes um do
+        # outro (só um dos dois recebe), o que não reflete a rede
+        # real (lá cada papel é um processo/máquina separado).
+        self.shared_browser = ServerBrowser(
+            discovery_port=TEST_DISCOVERY_PORT, timeout=6.0
+        )
+        self.shared_browser.start()
+        self.addCleanup(self.shared_browser.stop)
+
         self.server = HangmanServer(
             host="0.0.0.0",
             port=GAME_PORT,
@@ -51,7 +63,14 @@ class JoinAndReconnectEndToEndTests(unittest.TestCase):
                 # partir dela no Windows.
                 target_host=get_local_ip(),
                 interval=0.05,
+                # Sem isso, o anúncio usaria um id aleatório e um
+                # role fixo "PRIMARY" desligados do servidor real,
+                # e ele se veria como um Principal rival na rede.
+                server_id=self.server.server_id,
+                role_provider=lambda: self.server.role,
+                replication_port=self.server.replication_port,
             ),
+            peer_browser_factory=lambda: self.shared_browser,
         )
 
         self.server_thread = threading.Thread(
@@ -67,25 +86,23 @@ class JoinAndReconnectEndToEndTests(unittest.TestCase):
     def make_client(self):
         client = HangmanClient()
         client.browser.stop()
-        client.browser = ServerBrowser(
-            discovery_port=TEST_DISCOVERY_PORT, timeout=6.0
-        )
-        client.browser.start()
+        client.browser = self.shared_browser
         return client
 
     def test_join_saves_server_name_and_reconnect_finds_it_via_discovery(self):
         player = self.make_client()
         self.addCleanup(player.close)
 
+        # Espera o Servidor terminar a eleição inicial (ver
+        # STARTUP_GRACE_PERIOD) e se anunciar como Principal —
+        # não basta aparecer na descoberta, ele começa "ELECTING".
         pump(
             player.root,
-            lambda: len(player.discovered_servers) > 0,
-            timeout=4.0,
+            lambda: player.get_primary_server() is not None,
+            timeout=8.0,
         )
 
         player.nickname_entry.insert(0, "Jogador E2E")
-        player.server_listbox.selection_clear(0, "end")
-        player.server_listbox.selection_set(0)
 
         player.connect_new_player()
 
@@ -106,19 +123,19 @@ class JoinAndReconnectEndToEndTests(unittest.TestCase):
         original_session_id = saved["session_id"]
 
         # Simula a conexão caindo (ex.: fechar e reabrir o cliente).
-        # O ServerBrowser do cliente antigo também para, como aconteceria
-        # de verdade ao fechar o processo — dois listeners de teste no
-        # mesmo processo disputando a mesma porta UDP não é um cenário real.
+        # O ServerBrowser é compartilhado neste teste (ver setUp) e
+        # continua vivo para o Servidor e para o próximo Cliente —
+        # um processo de verdade fechado levaria o seu junto, mas
+        # aqui isso não muda nada do que este teste observa.
         player.close_socket_only()
         player.connected = False
-        player.browser.stop()
 
         reconnector = self.make_client()
         self.addCleanup(reconnector.close)
 
         pump(
             reconnector.root,
-            lambda: len(reconnector.browser.list_servers()) > 0,
+            lambda: reconnector.get_primary_server() is not None,
             timeout=4.0,
         )
 

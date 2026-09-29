@@ -7,7 +7,7 @@ import time
 import tkinter as tk
 from tkinter import messagebox
 
-from discovery import ServerBrowser
+from discovery import ROLE_PRIMARY, ServerBrowser
 
 from protocol import (
     send_message,
@@ -24,9 +24,11 @@ from server import (
 
 DISCOVERY_REFRESH_MS = 500
 
-# Quanto tempo esperar a Descoberta automática
-# reencontrar o Servidor de uma Sessão salva.
-RECONNECT_SEARCH_TIMEOUT = 8.0
+# Quanto tempo esperar a Descoberta automática encontrar o
+# Servidor Principal ativo na rede (para uma Sessão salva, ou
+# depois de uma queda: dá tempo do failover entre Servidores
+# terminar antes de desistir).
+RECONNECT_SEARCH_TIMEOUT = 25.0
 RECONNECT_SEARCH_RETRY_MS = 300
 
 BASE_DIR = os.path.dirname(
@@ -148,6 +150,8 @@ class HangmanClient:
         )
 
         self.discovered_servers = []
+
+        self.current_primary = None
 
         self._discovery_job = None
 
@@ -412,11 +416,26 @@ class HangmanClient:
 
             self._reconnect_search_job = None
 
+    def get_primary_server(self):
+        """
+        O único Servidor que os Jogadores enxergam: o Principal
+        atual entre os anunciados na rede. Não há mais escolha
+        manual — os demais Servidores encontrados são Reservas e
+        ficam invisíveis para quem só quer jogar.
+        """
+
+        for server in self.browser.list_servers():
+
+            if server.get("role") == ROLE_PRIMARY:
+                return server
+
+        return None
+
     def refresh_discovered_servers(self):
 
         if not hasattr(
             self,
-            "server_listbox"
+            "server_status_label"
         ):
             return
 
@@ -424,113 +443,47 @@ class HangmanClient:
             self.browser.list_servers()
         )
 
-        old_names = [
-            server["name"]
-            for server in self.discovered_servers
-        ]
+        primary = self.get_primary_server()
 
-        new_names = [
-            server["name"]
-            for server in servers
-        ]
+        self.discovered_servers = servers
 
-        # Evita destruir/recriar a lista (e o "piscar" visual)
-        # quando nada mudou desde o último refresh.
-        unchanged = (
-            [
-                (
-                    server["name"],
-                    server["host"],
-                    server["port"]
-                )
-                for server in servers
-            ]
-            == [
-                (
-                    server["name"],
-                    server["host"],
-                    server["port"]
-                )
-                for server in self.discovered_servers
-            ]
+        self.current_primary = primary
+
+        backup_count = len(servers) - (
+            1 if primary else 0
         )
 
-        if not unchanged:
+        if primary is None:
 
-            previous_selection = (
-                self.server_listbox
-                .curselection()
+            self.server_status_label.config(
+                text=(
+                    "Procurando servidor ativo "
+                    "na rede..."
+                ),
+                fg="darkorange"
             )
 
-            previously_selected_name = None
+        else:
 
-            if (
-                previous_selection
-                and
-                previous_selection[0]
-                < len(old_names)
-            ):
-
-                previously_selected_name = (
-                    old_names[
-                        previous_selection[0]
-                    ]
+            extra = (
+                (
+                    f" • {backup_count} "
+                    "servidor(es) de reserva"
                 )
-
-            self.server_listbox.delete(
-                0,
-                tk.END
+                if backup_count > 0
+                else ""
             )
 
-            for server in servers:
-
-                self.server_listbox.insert(
-                    tk.END,
-                    (
-                        f"{server['name']}  "
-                        f"({server['host']}:"
-                        f"{server['port']})"
-                    )
-                )
-
-            self.discovered_servers = servers
-
-            if not servers:
-
-                self.server_status_label.config(
-                    text="Procurando servidores na rede..."
-                )
-
-            else:
-
-                self.server_status_label.config(
-                    text=(
-                        f"{len(servers)} "
-                        "servidor(es) encontrado(s)."
-                    )
-                )
-
-                select_index = 0
-
-                if (
-                    previously_selected_name
-                    in new_names
-                ):
-
-                    select_index = (
-                        new_names.index(
-                            previously_selected_name
-                        )
-                    )
-
-                self.server_listbox.selection_clear(
-                    0,
-                    tk.END
-                )
-
-                self.server_listbox.selection_set(
-                    select_index
-                )
+            self.server_status_label.config(
+                text=(
+                    f"Servidor ativo: "
+                    f"{primary['name']} "
+                    f"({primary['host']}:"
+                    f"{primary['port']})"
+                    f"{extra}"
+                ),
+                fg="darkgreen"
+            )
 
         self._discovery_job = (
             self.root.after(
@@ -538,33 +491,6 @@ class HangmanClient:
                 self.refresh_discovered_servers
             )
         )
-
-    def get_selected_server(self):
-
-        if not hasattr(
-            self,
-            "server_listbox"
-        ):
-            return None
-
-        selection = (
-            self.server_listbox
-            .curselection()
-        )
-
-        if not selection:
-            return None
-
-        index = selection[0]
-
-        if index >= len(
-            self.discovered_servers
-        ):
-            return None
-
-        return self.discovered_servers[
-            index
-        ]
 
     # ========================================================
     # ANFITRIÃO (HOSPEDAR)
@@ -583,7 +509,14 @@ class HangmanClient:
             HangmanServer(
                 host=HOSTED_SERVER_HOST,
                 port=HOSTED_SERVER_PORT,
-                server_name=server_name
+                server_name=server_name,
+
+                # Reaproveita o ServerBrowser que este próprio
+                # Cliente já mantém: dois sockets escutando a
+                # mesma porta UDP de descoberta no mesmo processo
+                # fariam um "roubar" os pacotes do outro.
+                peer_browser_factory=
+                    lambda: self.browser
             )
         )
 
@@ -862,7 +795,7 @@ class HangmanClient:
             )
 
         # ====================================================
-        # SERVIDORES NA REDE
+        # SERVIDOR ATIVO NA REDE
         # ====================================================
 
         discovery_frame = tk.Frame(
@@ -880,7 +813,7 @@ class HangmanClient:
 
         tk.Label(
             discovery_frame,
-            text="Servidores encontrados na rede",
+            text="Servidor da partida",
             font=(
                 "Arial",
                 12,
@@ -888,24 +821,12 @@ class HangmanClient:
             )
         ).pack()
 
-        self.server_listbox = tk.Listbox(
-            discovery_frame,
-            height=4,
-            font=(
-                "Arial",
-                11
-            ),
-            exportselection=False
-        )
-
-        self.server_listbox.pack(
-            fill="x",
-            pady=8
-        )
-
+        # Não há mais escolha manual: o Cliente sempre entra pelo
+        # Servidor Principal atual — os demais na rede são Reservas
+        # e assumem sozinhos se o Principal cair.
         self.server_status_label = tk.Label(
             discovery_frame,
-            text="Procurando servidores...",
+            text="Procurando servidor ativo na rede...",
             font=(
                 "Arial",
                 10
@@ -1118,7 +1039,7 @@ class HangmanClient:
             return
 
         server = (
-            self.get_selected_server()
+            self.get_primary_server()
         )
 
         if not server:
@@ -1126,9 +1047,10 @@ class HangmanClient:
             messagebox.showwarning(
                 "Atenção",
                 (
-                    "Nenhum servidor selecionado.\n\n"
+                    "Nenhum servidor ativo encontrado "
+                    "na rede.\n\n"
                     "Aguarde a descoberta encontrar "
-                    "um servidor na rede, ou hospede "
+                    "um servidor, ou hospede "
                     "uma partida."
                 )
             )
@@ -1175,13 +1097,19 @@ class HangmanClient:
 
     def find_server_and_connect(
         self,
-        server_name,
         handshake_payload,
         show_game_screen,
         on_status=None,
         on_not_found=None,
         deadline=None
     ):
+        """
+        Procura o Servidor Principal atual na rede e conecta a
+        ele — não importa qual seja (pode ter mudado por um
+        failover entre Servidores desde a última vez). Tenta de
+        novo a cada RECONNECT_SEARCH_RETRY_MS até encontrar um
+        Principal ou estourar o prazo.
+        """
 
         # Cancela qualquer busca anterior pendente (ex.: usuário
         # clicou reconectar de novo antes da primeira terminar).
@@ -1194,14 +1122,7 @@ class HangmanClient:
                 + RECONNECT_SEARCH_TIMEOUT
             )
 
-        found = None
-
-        for server in self.browser.list_servers():
-
-            if server["name"] == server_name:
-
-                found = server
-                break
+        found = self.get_primary_server()
 
         if found is not None:
 
@@ -1239,8 +1160,8 @@ class HangmanClient:
 
                 on_status(
                     (
-                        f"Servidor \"{server_name}\" "
-                        "não encontrado na rede."
+                        "Nenhum servidor ativo "
+                        "encontrado na rede."
                     ),
                     "red"
                 )
@@ -1262,8 +1183,7 @@ class HangmanClient:
 
             on_status(
                 (
-                    f"Procurando servidor "
-                    f"\"{server_name}\" "
+                    "Procurando servidor ativo "
                     f"na rede... ({remaining}s)"
                 ),
                 "darkorange"
@@ -1273,7 +1193,6 @@ class HangmanClient:
             self.root.after(
                 RECONNECT_SEARCH_RETRY_MS,
                 lambda: self.find_server_and_connect(
-                    server_name,
                     handshake_payload,
                     show_game_screen,
                     on_status,
@@ -1310,29 +1229,7 @@ class HangmanClient:
             )
         )
 
-        server_name = (
-            session.get(
-                "server_name"
-            )
-        )
-
         if not session_id:
-
-            self.clear_saved_session()
-            self.create_login_screen()
-            return
-
-        if not server_name:
-
-            messagebox.showwarning(
-                "Reconexão",
-                (
-                    "Esta sessão salva é de uma "
-                    "versão antiga e não tem um "
-                    "servidor associado.\n\n"
-                    "Entre em uma nova partida."
-                )
-            )
 
             self.clear_saved_session()
             self.create_login_screen()
@@ -1358,16 +1255,11 @@ class HangmanClient:
                 )
 
         on_status(
-            (
-                f"Procurando servidor "
-                f"\"{server_name}\" "
-                "na rede..."
-            ),
+            "Procurando servidor ativo na rede...",
             "darkorange"
         )
 
         self.find_server_and_connect(
-            server_name,
             {
                 "type":
                     "RECONNECT",
@@ -1395,12 +1287,6 @@ class HangmanClient:
             self.load_saved_session()
         )
 
-        server_name = (
-            saved.get("server_name")
-            if saved
-            else None
-        )
-
         if not session_id and saved:
 
             session_id = (
@@ -1417,21 +1303,6 @@ class HangmanClient:
                 ),
                 fg="red"
             )
-
-            return
-
-        if not server_name:
-
-            self.status_label.config(
-                text=(
-                    "Sessão salva é de uma versão antiga "
-                    "e não tem servidor associado. Volte "
-                    "ao menu e entre em uma nova partida."
-                ),
-                fg="red"
-            )
-
-            self.clear_saved_session()
 
             return
 
@@ -1458,7 +1329,6 @@ class HangmanClient:
             )
 
         self.find_server_and_connect(
-            server_name,
             {
                 "type":
                     "RECONNECT",

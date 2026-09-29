@@ -20,11 +20,17 @@ class HangmanServerAnnouncesItselfTests(unittest.TestCase):
             server_name="VM-TESTE",
             announcer_factory=lambda: ServerAnnouncer(
                 server_name="VM-TESTE",
-                game_port=0,
+                game_port=server.port,
                 discovery_port=browser.port,
                 # Ver comentário equivalente em test_discovery.py.
                 target_host=get_local_ip(),
                 interval=0.05,
+                # Sem isso, o anúncio usaria um id aleatório e um
+                # role fixo "PRIMARY" desligados do servidor real,
+                # e ele se veria como um Principal rival na rede.
+                server_id=server.server_id,
+                role_provider=lambda: server.role,
+                replication_port=server.replication_port,
             ),
         )
 
